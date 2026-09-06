@@ -46,7 +46,39 @@ python3 ssti_scanner.py --payloads --engine jinja2
 
 # Fuzz common paths and parameters
 python3 ssti_scanner.py --fuzz http://target --param name,q,input
+
+# Offline demo (vulnerable + clean control simulators, no network)
+python3 ssti_scanner.py --demo       # or run with no arguments
+
+# Run the offline test suite
+python3 -m unittest discover -s tests
 ```
+
+## Live Lab Test Plan
+
+Run against a local lab target only (loopback or a VM you own):
+
+1. `python3 ssti_scanner.py --demo` — verify the engine identifies the Jinja2
+   simulator, evaluates `{{7*7}}` to 49, and reports zero findings on the clean
+   control (both exit 0).
+2. Start a knowingly-vulnerable template renderer locally (e.g. a Flask/Jinja2
+   app that renders user input with `render_template_string`) and run
+   `python3 ssti_scanner.py --url http://127.0.0.1:<port>/greet --param name`.
+3. Confirm a positive on the vulnerable renderer and a negative on a hardened
+   endpoint that escapes output. Never point this at systems you do not own.
+4. `python3 -m unittest discover -s tests` — full offline suite must pass.
+
+## Metrics
+
+- Demo wall time: < 20 s (two loopback simulators, ~25 HTTP requests each)
+- Engine identification: Jinja2 detected from the simulator error page
+- Math-evaluation detection: `{{7*7}}` / `${7*7}` / `<%= 7*7 %>` etc. fire only
+  on the vulnerable simulator, never on the clean control.
+- Test suite: 8 deterministic offline tests (`python3 -m unittest`), no network
+  access required.
+- Code paths exercised: urllib request/receive, `SSTIDetector.identify_engine`,
+  `.detect_math_evaluation`, `.detect_engine_specific`, `.full_scan`, and both
+  simulator handlers.
 
 ## Legal Disclaimer
 

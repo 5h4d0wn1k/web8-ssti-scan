@@ -3,16 +3,22 @@
 
 Template injection detection for Jinja2, Twig, Mako, ERB, and other
 server-side template engines, with payload crafting and RCE verification.
-Uses only standard-library modules.
+
+Transport is stdlib urllib. `--demo` runs the full detection engine against a
+built-in template-evaluating simulator (and a clean control) over loopback,
+exercising the same HTTP code path as a live target.
 """
 
+import argparse
+import html as html_mod
 import re
 import sys
-import math
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 
@@ -103,6 +109,93 @@ class TemplatePayloads:
     }
 
 
+# ---------------------------------------------------------------------------
+# Built-in template simulators (importable so tests host them on loopback)
+# ---------------------------------------------------------------------------
+
+def _first_param_value(query: str) -> str:
+    params = urllib.parse.parse_qs(query)
+    for sub in params.values():
+        for v in sub:
+            return v
+    return ""
+
+
+class VulnSSTIHandler(BaseHTTPRequestHandler):
+    """Simulates an app that evaluates template expressions server-side.
+
+    `{{7*7}}`, `${7*7}`, `<%= 7*7 %>`, etc. evaluate to 49; invalid
+    `{{...}}`/`{%...%}` syntax produces a Jinja2-flavored error page.
+    """
+
+    def _render(self, inp):
+        if "invalidsyntax" in inp:
+            return (
+                "<html><body><h1>500 Internal Server Error</h1>"
+                "<pre>jinja2.exceptions.TemplateSyntaxError: unexpected token "
+                "'invalid syntax'</pre></body></html>",
+                500,
+            )
+        m = re.search(r"(\d+)\s*\*\s*(\d+)", inp)
+        if m:
+            return "Hello, %s!" % (int(m.group(1)) * int(m.group(2))), 200
+        return "Hello, %s!" % inp, 200
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        self._respond(_first_param_value(parsed.query))
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        self._respond(_first_param_value(body))
+
+    def _respond(self, inp):
+        body, status = self._render(inp)
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    log_message = lambda self, fmt, *args: None  # noqa: E731
+
+
+class CleanSSTIHandler(BaseHTTPRequestHandler):
+    """Control server: HTML-escapes input, never evaluates templates."""
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        self._respond(_first_param_value(parsed.query))
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        self._respond(_first_param_value(body))
+
+    def _respond(self, inp):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(
+            ("Hello, %s!" % html_mod.escape(inp)).encode()
+        )
+
+    log_message = lambda self, fmt, *args: None  # noqa: E731
+
+
+class SSTIHelpers:
+    """Shared payload-crafting helpers for detection and exploitation."""
+
+    MATH_EXPR = re.compile(r"(\d+)\s*\*\s*(\d+)")
+
+    @staticmethod
+    def evaluate_math(inp):
+        m = SSTIHelpers.MATH_EXPR.search(inp)
+        if m:
+            return str(int(m.group(1)) * int(m.group(2)))
+        return None
+
+
 class SSTIDetector:
     """Detect template injection vulnerability and identify the engine."""
 
@@ -117,11 +210,14 @@ class SSTIDetector:
     ]
 
     def __init__(self, target_url: str, param: str = "name",
-                 method: str = "GET", headers: Optional[dict] = None):
+                 method: str = "GET", headers: Optional[dict] = None,
+                 timeout: int = 10, verbose: bool = False):
         self.target_url = target_url
         self.param = param
         self.method = method.upper()
         self.headers = headers or {}
+        self.timeout = timeout
+        self.verbose = verbose
         self.detected_engine = None
 
     def _send(self, payload: str) -> tuple:
@@ -138,8 +234,11 @@ class SSTIDetector:
         for k, v in self.headers.items():
             req.add_header(k, v)
 
+        if self.verbose:
+            print(f"      > {self.method} {self.target_url} param={self.param}")
+
         try:
-            resp = urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
             return resp.status, resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", errors="replace")
@@ -157,7 +256,7 @@ class SSTIDetector:
         for k, v in self.headers.items():
             req.add_header(k, v)
         try:
-            resp = urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
             return resp.status, resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", errors="replace")
@@ -185,6 +284,8 @@ class SSTIDetector:
                 "vulnerable": vulnerable,
                 "status": status,
             })
+            if self.verbose and vulnerable:
+                print(f"  [+] Math evaluation: {payload} -> {expected}")
         return results
 
     def identify_engine(self) -> Optional[str]:
@@ -204,7 +305,7 @@ class SSTIDetector:
 
         engine_keywords = {
             "jinja2": ["jinja", "jinja2", "jinja2.exceptions"],
-            "twig": ["twig", "twig\\", "twig_error"],
+            "twig": ["twig", "twig_error"],
             "mako": ["mako", "mako.template", "mako.exceptions"],
             "erb": ["erb", "erubis", "actionview"],
             "freemarker": ["freemarker", "ftl", "freemarker.template"],
@@ -228,13 +329,15 @@ class SSTIDetector:
         results = {}
         engine = self.detected_engine or self.identify_engine()
         if engine and engine in TemplatePayloads.ENGINES:
+            any_vuln = False
+            last = {}
             for payload in TemplatePayloads.ENGINES[engine]["detect"]:
                 status, body = self._send(payload)
-                results[engine] = {
-                    "payload": payload,
-                    "vulnerable": "49" in body,
-                    "status": status,
-                }
+                vuln = "49" in body
+                last = {"payload": payload, "vulnerable": vuln, "status": status}
+                any_vuln = any_vuln or vuln
+            last["vulnerable"] = any_vuln
+            results[engine] = last
         else:
             for eng_name, eng_data in TemplatePayloads.ENGINES.items():
                 for payload in eng_data["detect"][:1]:
@@ -256,6 +359,8 @@ class SSTIDetector:
         results["math_eval"] = self.detect_math_evaluation()
         results["engine_specific"] = self.detect_engine_specific()
         results["vulnerable"] = any(r["vulnerable"] for r in results["math_eval"])
+        if self.verbose:
+            print(f"    vulnerable: {results['vulnerable']}, engine: {results['engine']}")
         return results
 
 
@@ -286,12 +391,15 @@ class SSTIExploiter:
 
     def __init__(self, target_url: str, param: str = "name",
                  method: str = "GET", headers: Optional[dict] = None,
-                 engine: Optional[str] = None):
+                 engine: Optional[str] = None, timeout: int = 15,
+                 verbose: bool = False):
         self.target_url = target_url
         self.param = param
         self.method = method.upper()
         self.headers = headers or {}
         self.engine = engine
+        self.timeout = timeout
+        self.verbose = verbose
         self.builder = SSTIPayloadBuilder()
 
     def _send(self, payload: str) -> tuple:
@@ -306,7 +414,7 @@ class SSTIExploiter:
         for k, v in self.headers.items():
             req.add_header(k, v)
         try:
-            resp = urllib.request.urlopen(req, timeout=15)
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
             return resp.status, resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", errors="replace")
@@ -402,18 +510,92 @@ class SSTIScanner:
         return results
 
 
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+
+def run_demo(clean: bool = False, verbose: bool = False):
+    """Offline demo: run the full detection engine against a built-in simulator.
+
+    `clean` selects the HTML-escaping control handler; otherwise the
+    template-evaluating vulnerable handler is used. Both are served over
+    loopback and hit through the exact same urllib HTTP code path as a live
+    remote target.
+    """
+    Handler = CleanSSTIHandler if clean else VulnSSTIHandler
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    label = ("CLEAN control (HTML-escapes input)"
+             if clean else "VULNERABLE (evaluates template expressions)")
+    print("  +------------------------------------------+")
+    print("  |        WEB8 -- SSTI Scanner               |")
+    print("  +------------------------------------------+")
+    print(f"[*] DEMO MODE: template simulator ({label}) on http://127.0.0.1:{port}")
+    print("[*] The engine posts payloads through urllib and inspects responses.")
+    print()
+
+    url = f"http://127.0.0.1:{port}/greet"
+    detector = SSTIDetector(url, param="name", method="GET",
+                            timeout=5, verbose=verbose)
+    print("[*] Running detection scan (engine ID, math eval, engine-specific)...")
+    results = detector.full_scan()
+
+    print("\n  Detection results:")
+    print(f"    engine:     {results.get('engine')}")
+    print(f"    vulnerable: {results.get('vulnerable')}")
+    print("    math evaluation:")
+    for r in results.get("math_eval", []):
+        marker = "[VULN]" if r["vulnerable"] else "[----]"
+        print(f"      {marker}  {r['payload']}")
+    print("    engine-specific:")
+    for eng, data in results.get("engine_specific", {}).items():
+        print(f"      {eng}: vulnerable={data.get('vulnerable')} "
+              f"status={data.get('status')}")
+
+    found = bool(results.get("vulnerable"))
+    server.shutdown()
+    server.server_close()
+    print()
+
+    if found and not clean:
+        m = [r for r in results["math_eval"] if r["vulnerable"]]
+        if m:
+            print(f"[+] Template expression evaluated: {m[0]['payload']} -> {m[0]['expected']}")
+        print("[+] Demo: SSTI detected on vulnerable simulator (expected behavior).")
+        print("[+] Exit 0 -- scanner works correctly.")
+        return 0
+    if clean and not found:
+        print("[+] Demo: clean control produced zero SSTI findings (no false positive).")
+        print("[+] Exit 0 -- scanner works correctly.")
+        return 0
+    print("[-] Demo: unexpected result -- scanner may need tuning.")
+    return 1
+
+
+def demo():
+    """Run both simulator demos in sequence."""
+    rc = run_demo(clean=False)
+    if rc == 0:
+        print()
+        rc = run_demo(clean=True)
+    sys.exit(rc)
+
+
 def main():
     """CLI entry point."""
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="WEB8 — SSTI Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python3 ssti_scanner.py --url http://target/?name= --param name\n"
-            "  python3 ssti_scanner.py --url http://target/search --param q --method POST\n"
-            "  python3 ssti_scanner.py --fuzz http://target --params name,q,input\n"
+            "  python3 ssti_scanner.py --url http://127.0.0.1:8080/?name= --param name\n"
+            "  python3 ssti_scanner.py --url http://127.0.0.1:8080/search --param q --method POST\n"
+            "  python3 ssti_scanner.py --fuzz http://127.0.0.1:8080 --params name,q,input\n"
+            "  python3 ssti_scanner.py --demo\n"
+            "  python3 ssti_scanner.py                    # equivalent to --demo\n"
         ),
     )
     parser.add_argument("--url", help="Target URL (with param value in URL for GET)")
@@ -422,7 +604,17 @@ def main():
     parser.add_argument("--fuzz", help="Fuzz base URL with common paths/params")
     parser.add_argument("--payloads", action="store_true", help="Show payloads for engine")
     parser.add_argument("--engine", default="jinja2", help="Template engine for payload display")
+    parser.add_argument("--timeout", type=int, default=10,
+                        help="HTTP request timeout in seconds (default: 10)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose request logging and scan details")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run offline demo against built-in vulnerable/clean simulators")
     args = parser.parse_args()
+
+    if args.demo or not (args.url or args.fuzz or args.payloads):
+        demo()
+        return
 
     if args.payloads:
         print(f"=== SSTI Payloads for {args.engine} ===\n")
@@ -459,7 +651,8 @@ def main():
         sys.exit(1)
 
     print(f"=== SSTI Detection: {args.url} ===\n")
-    detector = SSTIDetector(args.url, param=args.param, method=args.method)
+    detector = SSTIDetector(args.url, param=args.param, method=args.method,
+                            timeout=args.timeout, verbose=args.verbose)
     results = detector.full_scan()
     print(f"Engine: {results.get('engine', 'unknown')}")
     print(f"Vulnerable: {results.get('vulnerable', False)}")
